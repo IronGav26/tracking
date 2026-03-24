@@ -1,0 +1,382 @@
+"""
+gui.py
+======
+Tkinter-based calibration GUI.
+
+Workflow
+--------
+1. Camera Preview tab  – live feed, click a skin region to sample HSV.
+2. HSV Tuning tab      – fine-tune lower/upper HSV bounds with sliders;
+                         live mask preview updates in real time.
+3. MIDI Mapping tab    – pick output port, MIDI channel, CC numbers for
+                         X / Y / Area axes, smoothing strength.
+4. Confirm button      – stores config and closes the window.
+
+The owner (main.py) reads app.confirmed and app.get_config() after mainloop.
+"""
+
+import tkinter as tk
+from tkinter import ttk, messagebox
+import threading
+import numpy as np
+import cv2
+from PIL import Image, ImageTk
+from midi_output import MidiOutput
+
+
+# ── palette ───────────────────────────────────────────────────────────────────
+BG       = "#1a1a2e"
+PANEL    = "#16213e"
+ACCENT   = "#0f3460"
+HIGHLIGHT= "#e94560"
+FG       = "#eaeaea"
+FONT     = ("Consolas", 10)
+FONT_H   = ("Consolas", 12, "bold")
+
+
+def _style_widget(w, **kw):
+    try:
+        w.configure(bg=BG, fg=FG, font=FONT, **kw)
+    except tk.TclError:
+        pass
+
+
+# ── main app ──────────────────────────────────────────────────────────────────
+
+class CalibrationApp:
+    """
+    Attributes
+    ----------
+    confirmed : bool   True if user clicked "Confirm & Start".
+    """
+
+    def __init__(self, root: tk.Tk, camera_index: int = 0):
+        self.root = root
+        self.confirmed = False
+        self._camera_index = camera_index
+        self._running = True
+
+        # Default HSV skin range (works for many light/medium skin tones)
+        self._lower = np.array([0,  30, 60],  dtype=np.uint8)
+        self._upper = np.array([25, 180, 255], dtype=np.uint8)
+
+        # Live camera
+        self._cap = cv2.VideoCapture(camera_index)
+        self._frame: np.ndarray | None = None
+        self._frame_lock = threading.Lock()
+
+        self._build_ui()
+        self._start_capture_thread()
+        self._update_previews()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        r = self.root
+        r.title("Hand-to-MIDI  •  Calibration")
+        r.configure(bg=BG)
+        r.resizable(False, False)
+
+        title = tk.Label(r, text="✋  Hand-to-MIDI CC Controller",
+                         bg=BG, fg=HIGHLIGHT, font=("Consolas", 15, "bold"))
+        title.pack(pady=(12, 4))
+
+        sub = tk.Label(r, text="Calibrate skin colour, tune HSV mask, map MIDI CCs",
+                       bg=BG, fg=FG, font=FONT)
+        sub.pack(pady=(0, 8))
+
+        nb = ttk.Notebook(r)
+        nb.pack(fill="both", expand=True, padx=12, pady=4)
+
+        self._tab_preview(nb)
+        self._tab_hsv(nb)
+        self._tab_midi(nb)
+
+        confirm = tk.Button(
+            r, text="✔  Confirm & Start",
+            bg=HIGHLIGHT, fg="white", font=("Consolas", 11, "bold"),
+            activebackground="#c73652", activeforeground="white",
+            relief="flat", padx=14, pady=6,
+            command=self._on_confirm,
+        )
+        confirm.pack(pady=10)
+
+    # ── Tab 1: Camera Preview ─────────────────────────────────────────────────
+
+    def _tab_preview(self, nb: ttk.Notebook):
+        frame = tk.Frame(nb, bg=BG)
+        nb.add(frame, text="  📷 Camera Preview  ")
+
+        info = tk.Label(
+            frame,
+            text="Click on your skin in the preview to sample the HSV colour.",
+            bg=BG, fg=FG, font=FONT,
+        )
+        info.pack(pady=(8, 4))
+
+        self._preview_label = tk.Label(frame, bg=BG, cursor="crosshair")
+        self._preview_label.pack(padx=10, pady=6)
+        self._preview_label.bind("<Button-1>", self._on_click_sample)
+
+        # Camera index
+        row = tk.Frame(frame, bg=BG)
+        row.pack(pady=4)
+        tk.Label(row, text="Camera index:", bg=BG, fg=FG, font=FONT).pack(side="left")
+        self._cam_var = tk.IntVar(value=self._camera_index)
+        spin = tk.Spinbox(row, from_=0, to=10, textvariable=self._cam_var,
+                          width=4, bg=PANEL, fg=FG, font=FONT,
+                          buttonbackground=ACCENT,
+                          command=self._on_camera_change)
+        spin.pack(side="left", padx=6)
+
+        self._flip_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(row, text="Mirror", variable=self._flip_var,
+                       bg=BG, fg=FG, font=FONT,
+                       selectcolor=ACCENT).pack(side="left", padx=6)
+
+    # ── Tab 2: HSV Tuning ─────────────────────────────────────────────────────
+
+    def _tab_hsv(self, nb: ttk.Notebook):
+        frame = tk.Frame(nb, bg=BG)
+        nb.add(frame, text="  🎨 HSV Mask  ")
+
+        # Mask preview label
+        self._mask_label = tk.Label(frame, bg=BG)
+        self._mask_label.grid(row=0, column=0, columnspan=3, pady=8)
+
+        labels = ["H min", "H max", "S min", "S max", "V min", "V max"]
+        init   = [int(self._lower[0]), int(self._upper[0]),
+                  int(self._lower[1]), int(self._upper[1]),
+                  int(self._lower[2]), int(self._upper[2])]
+        maxv   = [179, 179, 255, 255, 255, 255]
+        self._hsv_vars: list[tk.IntVar] = []
+
+        for i, (lbl, val, mx) in enumerate(zip(labels, init, maxv)):
+            r = i + 1
+            tk.Label(frame, text=lbl, bg=BG, fg=FG, font=FONT,
+                     width=7, anchor="e").grid(row=r, column=0, padx=(12, 4), pady=3)
+            var = tk.IntVar(value=val)
+            self._hsv_vars.append(var)
+            scale = tk.Scale(frame, variable=var, from_=0, to=mx,
+                             orient="horizontal", length=320,
+                             bg=ACCENT, fg=FG, troughcolor=PANEL,
+                             highlightthickness=0, font=FONT,
+                             command=lambda _e, _i=i: self._on_hsv_change())
+            scale.grid(row=r, column=1, padx=4, pady=3)
+            val_lbl = tk.Label(frame, textvariable=var, width=4,
+                               bg=BG, fg=HIGHLIGHT, font=FONT)
+            val_lbl.grid(row=r, column=2, padx=(4, 12))
+
+        # Reset button
+        tk.Button(frame, text="Reset to defaults",
+                  bg=PANEL, fg=FG, font=FONT, relief="flat",
+                  command=self._reset_hsv).grid(
+                      row=len(labels) + 1, column=0, columnspan=3, pady=10)
+
+    # ── Tab 3: MIDI Mapping ───────────────────────────────────────────────────
+
+    def _tab_midi(self, nb: ttk.Notebook):
+        frame = tk.Frame(nb, bg=BG)
+        nb.add(frame, text="  🎛️ MIDI Mapping  ")
+
+        def row_label(r, text):
+            tk.Label(frame, text=text, bg=BG, fg=FG, font=FONT,
+                     anchor="e", width=18).grid(row=r, column=0,
+                                                 padx=(14, 6), pady=6)
+
+        # MIDI port
+        row_label(0, "MIDI Output Port:")
+        ports = MidiOutput.list_ports() or ["(none – virtual)"]
+        self._port_var = tk.StringVar(value=ports[0])
+        port_cb = ttk.Combobox(frame, textvariable=self._port_var,
+                               values=ports, width=30, state="readonly")
+        port_cb.grid(row=0, column=1, columnspan=2, padx=6, pady=6, sticky="w")
+
+        refresh_btn = tk.Button(frame, text="⟳", bg=PANEL, fg=FG,
+                                font=FONT, relief="flat",
+                                command=lambda: self._refresh_ports(port_cb))
+        refresh_btn.grid(row=0, column=3, padx=4)
+
+        # MIDI channel
+        row_label(1, "MIDI Channel (1-16):")
+        self._channel_var = tk.IntVar(value=1)
+        tk.Spinbox(frame, from_=1, to=16, textvariable=self._channel_var,
+                   width=5, bg=PANEL, fg=FG, font=FONT,
+                   buttonbackground=ACCENT).grid(
+                       row=1, column=1, sticky="w", padx=6, pady=6)
+
+        # CC number mappings
+        cc_defaults = {"X position": 1, "Y position": 2, "Hand area (Z)": 11}
+        self._cc_vars: dict[str, tk.IntVar] = {}
+        row_idx = 2
+        for axis, default in cc_defaults.items():
+            row_label(row_idx, f"{axis}  →  CC#")
+            var = tk.IntVar(value=default)
+            self._cc_vars[axis] = var
+            tk.Spinbox(frame, from_=0, to=127, textvariable=var,
+                       width=5, bg=PANEL, fg=FG, font=FONT,
+                       buttonbackground=ACCENT).grid(
+                           row=row_idx, column=1, sticky="w", padx=6, pady=6)
+            row_idx += 1
+
+        # Smoothing
+        row_label(row_idx, "Smoothing (α):")
+        self._smooth_var = tk.DoubleVar(value=0.3)
+        smooth_scale = tk.Scale(
+            frame, variable=self._smooth_var,
+            from_=0.05, to=1.0, resolution=0.05,
+            orient="horizontal", length=200,
+            bg=ACCENT, fg=FG, troughcolor=PANEL,
+            highlightthickness=0, font=FONT,
+        )
+        smooth_scale.grid(row=row_idx, column=1, columnspan=2,
+                          sticky="w", padx=6, pady=6)
+        tk.Label(frame,
+                 text="← smoother          faster →",
+                 bg=BG, fg=FG, font=("Consolas", 8)).grid(
+                     row=row_idx + 1, column=1, columnspan=2,
+                     sticky="w", padx=6)
+
+    # ── event handlers ────────────────────────────────────────────────────────
+
+    def _on_click_sample(self, event):
+        """Sample HSV at clicked pixel and update sliders."""
+        with self._frame_lock:
+            frame = self._frame
+        if frame is None:
+            return
+
+        # Map click coords back to frame coords
+        disp_w, disp_h = self._preview_label.winfo_width(), self._preview_label.winfo_height()
+        fh, fw = frame.shape[:2]
+        px = int(event.x * fw / max(disp_w, 1))
+        py = int(event.y * fh / max(disp_h, 1))
+        px, py = np.clip(px, 0, fw - 1), np.clip(py, 0, fh - 1)
+
+        # Sample a 15×15 patch
+        r = 7
+        patch = frame[max(0, py-r):py+r+1, max(0, px-r):px+r+1]
+        hsv_patch = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+        h_mean = int(np.mean(hsv_patch[:, :, 0]))
+        s_mean = int(np.mean(hsv_patch[:, :, 1]))
+        v_mean = int(np.mean(hsv_patch[:, :, 2]))
+
+        # Set generous band around sampled value
+        h_margin, s_margin, v_margin = 15, 60, 60
+        new_vals = [
+            max(0,   h_mean - h_margin),   # H min
+            min(179, h_mean + h_margin),   # H max
+            max(0,   s_mean - s_margin),   # S min
+            min(255, s_mean + s_margin),   # S max
+            max(0,   v_mean - v_margin),   # V min
+            min(255, v_mean + v_margin),   # V max
+        ]
+        for var, val in zip(self._hsv_vars, new_vals):
+            var.set(val)
+        self._on_hsv_change()
+
+    def _on_hsv_change(self, *_):
+        v = [var.get() for var in self._hsv_vars]
+        self._lower = np.array([v[0], v[2], v[4]], dtype=np.uint8)
+        self._upper = np.array([v[1], v[3], v[5]], dtype=np.uint8)
+
+    def _reset_hsv(self):
+        defaults = [0, 25, 30, 180, 60, 255]
+        for var, val in zip(self._hsv_vars, defaults):
+            var.set(val)
+        self._on_hsv_change()
+
+    def _on_camera_change(self):
+        idx = self._cam_var.get()
+        if idx == self._camera_index:
+            return
+        self._camera_index = idx
+        old_cap = self._cap
+        self._cap = cv2.VideoCapture(idx)
+        old_cap.release()
+
+    def _refresh_ports(self, combobox):
+        ports = MidiOutput.list_ports() or ["(none – virtual)"]
+        combobox["values"] = ports
+        self._port_var.set(ports[0])
+
+    def _on_confirm(self):
+        if not self._cap.isOpened():
+            messagebox.showerror("Camera error",
+                                 "Cannot open camera. Check camera index.")
+            return
+        self.confirmed = True
+        self._running = False
+        self._cap.release()
+        cv2.destroyAllWindows()
+        self.root.quit()
+
+    # ── capture thread & preview update ──────────────────────────────────────
+
+    def _start_capture_thread(self):
+        def _capture():
+            while self._running:
+                if self._cap.isOpened():
+                    ret, frame = self._cap.read()
+                    if ret:
+                        if self._flip_var.get():
+                            frame = cv2.flip(frame, 1)
+                        with self._frame_lock:
+                            self._frame = frame
+
+        t = threading.Thread(target=_capture, daemon=True)
+        t.start()
+
+    def _update_previews(self):
+        if not self._running:
+            return
+
+        with self._frame_lock:
+            frame = self._frame.copy() if self._frame is not None else None
+
+        if frame is not None:
+            # ── camera preview (320×240) ──────────────────────────────────────
+            small = cv2.resize(frame, (320, 240))
+            rgb   = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            img   = ImageTk.PhotoImage(Image.fromarray(rgb))
+            self._preview_label.configure(image=img)
+            self._preview_label.image = img
+
+            # ── mask preview (320×240) ────────────────────────────────────────
+            hsv  = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, self._lower, self._upper)
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+            # Colour overlay: green = detected skin
+            overlay = small.copy()
+            overlay[mask > 0] = [0, 220, 80]
+            blend = cv2.addWeighted(small, 0.5, overlay, 0.5, 0)
+
+            mask_rgb = cv2.cvtColor(blend, cv2.COLOR_BGR2RGB)
+            mask_img = ImageTk.PhotoImage(Image.fromarray(mask_rgb))
+            self._mask_label.configure(image=mask_img)
+            self._mask_label.image = mask_img
+
+        self.root.after(33, self._update_previews)   # ~30 fps
+
+    # ── config export ─────────────────────────────────────────────────────────
+
+    def get_config(self) -> dict:
+        """Return the user's choices as a plain dict."""
+        cc_map = {
+            "x":    self._cc_vars["X position"].get(),
+            "y":    self._cc_vars["Y position"].get(),
+            "area": self._cc_vars["Hand area (Z)"].get(),
+        }
+        return {
+            "lower_hsv":    self._lower.tolist(),
+            "upper_hsv":    self._upper.tolist(),
+            "camera_index": self._camera_index,
+            "flip_camera":  self._flip_var.get(),
+            "midi_port":    self._port_var.get(),
+            "midi_channel": self._channel_var.get() - 1,   # 0-indexed
+            "cc_map":       cc_map,
+            "smoothing":    self._smooth_var.get(),
+        }
